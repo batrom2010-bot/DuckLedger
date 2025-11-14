@@ -53,29 +53,35 @@ def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
 
-    cursor.execute(
-        """
+    # 1. Создаём таблицу расходов без timestamp (чтобы не падать на старых базах)
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS expenses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category TEXT NOT NULL,
-            amount REAL NOT NULL,
-            timestamp TEXT NOT NULL
+            user_id INTEGER,
+            category TEXT,
+            amount REAL
         )
-        """
-    )
+    """)
 
-    cursor.execute(
-        """
+    # 2. Проверяем, есть ли колонка timestamp, и добавляем её при необходимости
+    cursor.execute("PRAGMA table_info(expenses)")
+    columns = [row[1] for row in cursor.fetchall()]
+
+    if "timestamp" not in columns:
+        cursor.execute("ALTER TABLE expenses ADD COLUMN timestamp TEXT")
+
+    # 3. Таблица лимитов — как и было
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS limits (
             category TEXT PRIMARY KEY,
             limit_amount REAL NOT NULL
         )
-        """
-    )
+    """)
 
     conn.commit()
     conn.close()
     logger.info("Инициализация базы данных...")
+
 
 
 def add_expense(category: str, amount: float):
@@ -520,5 +526,6 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
