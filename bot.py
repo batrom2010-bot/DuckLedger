@@ -2,25 +2,24 @@ import asyncio
 import logging
 import os
 import sqlite3
-from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, FSInputFile
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    FSInputFile,
+    Message,
+    ReplyKeyboardRemove,
+)
 from openpyxl import Workbook
 
 # ==========================
-# НАСТРОЙКИ
+#  НАСТРОЙКИ И ЛОГИРОВАНИЕ
 # ==========================
-
-# Можно хранить токен в переменной окружения TELEGRAM_TOKEN
-BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "ВСТАВЬ_СЮДА_СВОЙ_ТОКЕН")
-
-# Имя файла базы
-DB_PATH = "бюджет.db"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,375 +27,498 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==========================
-# ИНИЦИАЛИЗАЦИЯ БАЗЫ
-# ==========================
+DB_FILE = "budget.db"
 
-
-def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-
-        # таблица расходов
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS expenses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                category TEXT NOT NULL,
-                amount REAL NOT NULL,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-
-        # таблица лимитов
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS limits (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                category TEXT NOT NULL,
-                limit_amount REAL NOT NULL,
-                UNIQUE (user_id, category)
-            )
-            """
-        )
-
-        conn.commit()
-
-
-def add_expense(user_id: int, category: str, amount: float):
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO expenses (user_id, category, amount, created_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (user_id, category, amount, datetime.utcnow().isoformat()),
-        )
-        conn.commit()
-
-
-def set_limit(user_id: int, category: str, limit_amount: float):
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO limits (user_id, category, limit_amount)
-            VALUES (?, ?, ?)
-            ON CONFLICT(user_id, category) DO UPDATE SET
-                limit_amount = excluded.limit_amount
-            """,
-            (user_id, category, limit_amount),
-        )
-        conn.commit()
-
-
-def get_expenses_for_user(user_id: int):
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT category, amount, created_at
-            FROM expenses
-            WHERE user_id = ?
-            ORDER BY created_at DESC
-            """,
-            (user_id,),
-        )
-        return cur.fetchall()
-
-
-def get_month_sum_by_category(user_id: int, category: str) -> float:
-    """Сумма по категории за текущий месяц (UTC)."""
-    now = datetime.utcnow()
-    month_start = datetime(now.year, now.month, 1).isoformat()
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT COALESCE(SUM(amount), 0)
-            FROM expenses
-            WHERE user_id = ?
-              AND category = ?
-              AND created_at >= ?
-            """,
-            (user_id, category, month_start),
-        )
-        row = cur.fetchone()
-        return float(row[0] or 0)
-
-
-def get_limit_for_category(user_id: int, category: str):
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT limit_amount
-            FROM limits
-            WHERE user_id = ? AND category = ?
-            """,
-            (user_id, category),
-        )
-        row = cur.fetchone()
-        return float(row[0]) if row else None
+# Токен берём из переменных окружения (Render) или из константы
+BOT_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or ""
 
 
 # ==========================
-# СТЕЙТЫ
+#  FSM СОСТОЯНИЯ
 # ==========================
-
 
 class InsertStates(StatesGroup):
-    waiting_for_data = State()
+    waiting_for_expenses = State()
 
 
 class LimitStates(StatesGroup):
-    waiting_for_data = State()
+    waiting_for_limits = State()
 
 
 # ==========================
-# УТИЛИТЫ
+#  РАБОТА С БАЗОЙ
 # ==========================
 
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
 
-def parse_category_amount_list(text: str):
-    """
-    Парсим сообщение формата:
-
-    Еда-500
-    Такси-300
-    Кофе-200
-
-    Работает и с одной строкой, и с несколькими.
-    Пустые строки игнорируются.
-    """
-    lines = [line.strip() for line in text.split("\n") if line.strip()]
-    if not lines:
-        raise ValueError("Пустое сообщение. Нечего разбирать.")
-
-    parsed = []
-    for line in lines:
-        if "-" not in line:
-            raise ValueError(f"Не удалось найти разделитель '-' в строке: «{line}»")
-        category, amount = line.split("-", 1)
-        category = category.strip()
-        amount = amount.strip().replace(",", ".")
-        if not category:
-            raise ValueError(f"Пустая категория в строке: «{line}»")
-        if not amount:
-            raise ValueError(f"Пустая сумма в строке: «{line}»")
-        try:
-            value = float(amount)
-        except ValueError:
-            raise ValueError(f"Сумма должна быть числом в строке: «{line}»")
-        parsed.append((category, value))
-
-    return parsed
-
-
-# ==========================
-# ХЕНДЛЕРЫ
-# ==========================
-
-
-async def cmd_start(message: Message):
-    text = (
-        "Привет, {name}!\n\n"
-        "Я бот для учёта расходов.\n\n"
-        "📥 Ввод расходов:\n"
-        "— Просто отправь строки вида:\n"
-        "  <b>Категория-Сумма</b>\n"
-        "  Можно сразу несколько строк.\n"
-        "  Пример:\n"
-        "  <code>Еда-500\\nТакси-300\\nКофе-200</code>\n\n"
-        "Или используй команду /insert.\n\n"
-        "💰 Лимиты по категориям:\n"
-        "— Команда /limit, формат такой же:\n"
-        "  <code>Еда-15000\\nТакси-5000</code>\n\n"
-        "ℹ️ Подробности смотри в /help"
-    ).format(name=message.from_user.first_name or "")
-    await message.answer(text, parse_mode="HTML")
-
-
-async def cmd_help(message: Message):
-    text = (
-        "<b>Команды бота DuckLedger</b>\n\n"
-        "• /start — краткая инструкция.\n"
-        "• /help — это сообщение.\n"
-        "• /insert — добавление расходов списком.\n"
-        "   Формат сообщения после команды:\n"
-        "   <code>Категория-Сумма</code>\n"
-        "   Можно одной строкой или несколькими, например:\n"
-        "   <code>Еда-500\\nТакси-300\\nКофе-200</code>\n\n"
-        "• /limit — установка лимитов по категориям.\n"
-        "   Формат такой же, можно сразу несколько категорий:\n"
-        "   <code>Еда-15000\\nТакси-5000</code>\n\n"
-        "• /export — выгрузить все ваши расходы в .xlsx файл.\n"
-    )
-    await message.answer(text, parse_mode="HTML")
-
-
-# ---------- /insert ----------
-
-
-async def cmd_insert(message: Message, state: FSMContext):
-    await state.set_state(InsertStates.waiting_for_data)
-    await message.answer(
-        "Отправь список расходов в формате:\n"
-        "<code>Категория-Сумма</code>\n"
-        "Можно одной строкой или несколькими. Пример:\n"
-        "<code>Еда-500\nТакси-300\nКофе-200</code>",
-        parse_mode="HTML",
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS expenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT NOT NULL,
+            amount REAL NOT NULL,
+            timestamp TEXT NOT NULL
+        )
+        """
     )
 
-
-async def process_insert(message: Message, state: FSMContext):
-    try:
-        parsed_rows = parse_category_amount_list(message.text)
-    except ValueError as e:
-        await message.answer(f"⚠️ {e}\n\nПопробуй ещё раз.")
-        return
-
-    warnings = []
-    for category, amount in parsed_rows:
-        add_expense(message.from_user.id, category, amount)
-
-        # Проверка лимита по категории, если задан
-        limit = get_limit_for_category(message.from_user.id, category)
-        if limit is not None:
-            total = get_month_sum_by_category(message.from_user.id, category)
-            if total > limit:
-                warnings.append(
-                    f"Категория <b>{category}</b>: "
-                    f"расход за месяц {total:.2f}, лимит {limit:.2f}"
-                )
-
-    await state.clear()
-
-    base_text = "✅ Расходы сохранены."
-    if warnings:
-        base_text += "\n\n⚠️ Превышены лимиты:\n" + "\n".join(f"— {w}" for w in warnings)
-
-    await message.answer(base_text, parse_mode="HTML")
-
-
-# ---------- /limit ----------
-
-
-async def cmd_limit(message: Message, state: FSMContext):
-    await state.set_state(LimitStates.waiting_for_data)
-    await message.answer(
-        "Отправь список лимитов в формате:\n"
-        "<code>Категория-Сумма</code>\n"
-        "Можно сразу несколько строк. Пример:\n"
-        "<code>Еда-15000\nТакси-5000</code>",
-        parse_mode="HTML",
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS limits (
+            category TEXT PRIMARY KEY,
+            limit_amount REAL NOT NULL
+        )
+        """
     )
 
-
-async def process_limit(message: Message, state: FSMContext):
-    try:
-        parsed_rows = parse_category_amount_list(message.text)
-    except ValueError as e:
-        await message.answer(f"⚠️ {e}\n\nПопробуй ещё раз.")
-        return
-
-    for category, amount in parsed_rows:
-        set_limit(message.from_user.id, category, amount)
-
-    await state.clear()
-    await message.answer("✅ Лимиты по категориям обновлены.", parse_mode="HTML")
+    conn.commit()
+    conn.close()
+    logger.info("Инициализация базы данных...")
 
 
-# ---------- /export ----------
+def add_expense(category: str, amount: float):
+    ts = datetime.utcnow().isoformat()
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO expenses (category, amount, timestamp) VALUES (?, ?, ?)",
+        (category, amount, ts),
+    )
+    conn.commit()
+    conn.close()
 
 
-async def cmd_export(message: Message):
-    """Экспорт всех расходов пользователя в Excel."""
-    rows = get_expenses_for_user(message.from_user.id)
-    if not rows:
-        await message.answer("У тебя ещё нет записанных расходов.")
-        return
+def set_limits(limits: dict[str, float]):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    for category, limit_value in limits.items():
+        cursor.execute(
+            """
+            INSERT INTO limits (category, limit_amount)
+            VALUES (?, ?)
+            ON CONFLICT(category) DO UPDATE SET limit_amount = excluded.limit_amount
+            """,
+            (category, limit_value),
+        )
+    conn.commit()
+    conn.close()
 
+
+def get_limits() -> dict[str, float]:
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT category, limit_amount FROM limits")
+    rows = cursor.fetchall()
+    conn.close()
+    return {cat: lim for cat, lim in rows}
+
+
+def get_month_range_utc() -> tuple[str, str]:
+    """Возвращает начало и конец текущего месяца в UTC в виде ISO-строк."""
+    now = datetime.utcnow()
+    month_start = datetime(now.year, now.month, 1)
+    if now.month == 12:
+        next_month = datetime(now.year + 1, 1, 1)
+    else:
+        next_month = datetime(now.year, now.month + 1, 1)
+    return month_start.isoformat(), next_month.isoformat()
+
+
+def get_month_stats():
+    """Статистика по текущему месяцу: сумма по категориям, общий итог."""
+    start_iso, end_iso = get_month_range_utc()
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT category, SUM(amount)
+        FROM expenses
+        WHERE timestamp >= ? AND timestamp < ?
+        GROUP BY category
+        ORDER BY SUM(amount) DESC
+        """,
+        (start_iso, end_iso),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    stats = {cat: float(total) for cat, total in rows}
+    total_sum = sum(stats.values())
+    return stats, total_sum
+
+
+def get_full_stats():
+    """Статистика за всё время."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT category, SUM(amount)
+        FROM expenses
+        GROUP BY category
+        ORDER BY SUM(amount) DESC
+        """
+    )
+    rows = cursor.fetchall()
+
+    cursor.execute("SELECT MIN(timestamp), MAX(timestamp) FROM expenses")
+    date_row = cursor.fetchone()
+    conn.close()
+
+    stats = {cat: float(total) for cat, total in rows}
+    total_sum = sum(stats.values())
+    min_ts, max_ts = date_row if date_row else (None, None)
+    return stats, total_sum, min_ts, max_ts
+
+
+# ==========================
+#  ЭКСПОРТ В EXCEL
+# ==========================
+
+def export_to_excel() -> str:
     wb = Workbook()
     ws = wb.active
     ws.title = "Расходы"
 
-    ws.append(["Категория", "Сумма", "Дата (UTC)"])
-    for category, amount, created_at in rows:
-        ws.append([category, amount, created_at])
+    # Заголовки в нужном формате
+    ws.append(["Дата", "Категория", "Сумма"])
 
-    filename = f"expenses_{message.from_user.id}.xlsx"
-    wb.save(filename)
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT category, amount, timestamp FROM expenses ORDER BY timestamp ASC"
+    )
+    rows = cursor.fetchall()
+    conn.close()
 
-    await message.answer_document(FSInputFile(filename))
-    os.remove(filename)
+    for category, amount, timestamp in rows:
+        dt = datetime.fromisoformat(timestamp)
+        date_str = dt.strftime("%d/%m/%Y")  # ДД/ММ/ГГГГ
+        ws.append([date_str, category, amount])
+
+    # Автоширина
+    for col in ws.columns:
+        max_len = 0
+        column = col[0].column_letter
+        for cell in col:
+            try:
+                max_len = max(max_len, len(str(cell.value)))
+            except Exception:
+                pass
+        ws.column_dimensions[column].width = max_len + 2
+
+    export_file = "export.xlsx"
+    wb.save(export_file)
+    return export_file
 
 
-# ---------- Фолбэк на обычный текст ----------
+# ==========================
+#  ПАРСИНГ СТРОК
+# ==========================
 
-
-async def fallback_message(message: Message):
+def parse_lines_to_pairs(text: str):
     """
-    Если пользователь без команды сразу шлёт 'Еда-500' и т.п.,
-    пробуем распарсить как расходы.
+    Парсит блок текста в формат:
+    Категория-Сумма
+    Категория2-Сумма2
+    Возвращает (список_пар, список_ошибок).
     """
-    try:
-        parsed_rows = parse_category_amount_list(message.text)
-    except Exception:
-        # Не парсим — это точно не наш формат
-        await message.answer(
-            "Я не понял сообщение.\n"
-            "Для ввода расходов используй /insert "
-            "или отправь строки вида <code>Категория-Сумма</code>.",
-            parse_mode="HTML",
-        )
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    pairs: list[tuple[str, float]] = []
+    errors: list[str] = []
+
+    for line in lines:
+        if "-" not in line:
+            errors.append(f"Не найден разделитель '-' в строке: «{line}»")
+            continue
+        cat_part, amount_part = line.split("-", 1)
+        category = cat_part.strip()
+        amount_str = amount_part.replace(",", ".").strip()
+
+        if not category or not amount_str:
+            errors.append(f"Неверный формат строки: «{line}»")
+            continue
+
+        try:
+            amount = float(amount_str)
+        except ValueError:
+            errors.append(f"Сумма не число в строке: «{line}»")
+            continue
+
+        if amount <= 0:
+            errors.append(f"Сумма должна быть > 0 в строке: «{line}»")
+            continue
+
+        pairs.append((category, amount))
+
+    return pairs, errors
+
+
+# ==========================
+#  ХЕНДЛЕРЫ
+# ==========================
+
+router = Router()
+
+
+@router.message(CommandStart())
+async def cmd_start(message: Message):
+    text = (
+        "Привет, {name}! Я бот для учёта расходов.\n\n"
+        "Отправь мне строку в формате:\n"
+        "`Категория-Сумма`\n"
+        "или используй команду /insert для ввода списка.\n\n"
+        "Команда /limit — для установки лимитов по категориям.\n"
+        "Команда /stats — краткая статистика по месяцу.\n"
+        "Команда /analitick — расширенная аналитика.\n"
+        "Команда /make — сформировать Excel-отчёт.\n"
+        "Команда /export — выгрузить Excel-таблицу."
+    ).format(name=message.from_user.first_name or "")
+
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    text = (
+        "📋 *Команды бота:*\n\n"
+        "*Обычный ввод:*\n"
+        "`Категория-Сумма`\n"
+        "Например: `Еда-500`\n\n"
+        "*/insert* — режим ввода списка расходов.\n"
+        "После команды отправь несколько строк вида:\n"
+        "`Еда-500`\n"
+        "`Такси-300`\n"
+        "`Кофе-200`\n\n"
+        "*(/limit)* — установка лимитов по категориям.\n"
+        "Формат такой же, можно несколько строк.\n"
+        "Пример:\n"
+        "`Еда-20000`\n"
+        "`Такси-5000`\n\n"
+        "*(/stats)* — статистика за текущий месяц по категориям "
+        "и сравнение с лимитами.\n"
+        "*(/analitick)* — расширенная аналитика: доли категорий, средний расход в день.\n"
+        "*(/make)* — сформировать и отправить Excel-отчёт (то же самое, что /export).\n"
+        "*(/export)* — выгрузка всех расходов в Excel."
+    )
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
+
+
+# --------- /insert ----------
+
+@router.message(Command("insert"))
+async def cmd_insert(message: Message, state: FSMContext):
+    await state.set_state(InsertStates.waiting_for_expenses)
+    text = (
+        "Отправь список расходов в формате:\n"
+        "`Категория-Сумма`\n"
+        "Можно сразу несколько строк:\n"
+        "`Еда-500`\n"
+        "`Такси-300`\n"
+        "`Кофе-200`"
+    )
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
+
+
+@router.message(InsertStates.waiting_for_expenses)
+async def process_insert_list(message: Message, state: FSMContext):
+    pairs, errors = parse_lines_to_pairs(message.text)
+
+    if not pairs and errors:
+        err_text = "⚠ Ошибка при разборе списка:\n" + "\n".join(errors)
+        await message.answer(err_text)
         return
 
-    # Если успешно распарсили — считаем как insert без состояния
-    for category, amount in parsed_rows:
-        add_expense(message.from_user.id, category, amount)
+    for category, amount in pairs:
+        add_expense(category, amount)
 
-    await message.answer("✅ Расходы сохранены (распознал без команды).")
+    resp_lines = [f"✅ Добавлено записей: {len(pairs)}"]
+    if errors:
+        resp_lines.append("\n⚠ Не удалось обработать некоторые строки:")
+        resp_lines.extend(errors)
+
+    await message.answer("\n".join(resp_lines))
+    await state.clear()
+
+
+# --------- /limit ----------
+
+@router.message(Command("limit"))
+async def cmd_limit(message: Message, state: FSMContext):
+    await state.set_state(LimitStates.waiting_for_limits)
+    text = (
+        "Отправь список лимитов в формате:\n"
+        "`Категория-Сумма`\n"
+        "Можно сразу несколько строк:\n"
+        "`Еда-20000`\n"
+        "`Такси-5000`"
+    )
+    await message.answer(text, parse_mode=ParseMode.MARKDOWN)
+
+
+@router.message(LimitStates.waiting_for_limits)
+async def process_limit_list(message: Message, state: FSMContext):
+    pairs, errors = parse_lines_to_pairs(message.text)
+
+    if not pairs and errors:
+        err_text = "⚠ Ошибка при разборе списка лимитов:\n" + "\n".join(errors)
+        await message.answer(err_text)
+        return
+
+    limits_dict = {cat: amount for cat, amount in pairs}
+    set_limits(limits_dict)
+
+    resp_lines = [f"✅ Обновлено лимитов: {len(limits_dict)}"]
+    if errors:
+        resp_lines.append("\n⚠ Не удалось обработать некоторые строки:")
+        resp_lines.extend(errors)
+
+    await message.answer("\n".join(resp_lines))
+    await state.clear()
+
+
+# --------- /stats ----------
+
+@router.message(Command("stats"))
+async def cmd_stats(message: Message):
+    stats, total_sum = get_month_stats()
+    limits = get_limits()
+
+    if not stats:
+        await message.answer("За текущий месяц расходов пока нет.")
+        return
+
+    lines = ["📊 *Статистика за текущий месяц:*", ""]
+    for cat, spent in stats.items():
+        line = f"• {cat}: {spent:.2f}"
+        if cat in limits:
+            limit_val = limits[cat]
+            diff = limit_val - spent
+            if diff >= 0:
+                line += f" из {limit_val:.2f} (осталось {diff:.2f})"
+            else:
+                line += f" из {limit_val:.2f} (перерасход {abs(diff):.2f})"
+        lines.append(line)
+
+    lines.append("")
+    lines.append(f"Итого: *{total_sum:.2f}*")
+
+    await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+# --------- /analitick ----------
+
+@router.message(Command("analitick"))
+async def cmd_analitick(message: Message):
+    stats, total_sum, min_ts, max_ts = get_full_stats()
+
+    if not stats:
+        await message.answer("Пока нет ни одной записи о расходах.")
+        return
+
+    # Период
+    if min_ts and max_ts:
+        start_dt = datetime.fromisoformat(min_ts)
+        end_dt = datetime.fromisoformat(max_ts)
+        days = max((end_dt.date() - start_dt.date()).days + 1, 1)
+    else:
+        days = 1
+
+    avg_per_day = total_sum / days
+
+    lines = [
+        "📈 *Аналитика расходов за всё время:*",
+        "",
+        f"Всего потрачено: *{total_sum:.2f}*",
+        f"Период: ~{days} дн.",
+        f"Средний расход в день: *{avg_per_day:.2f}*",
+        "",
+        "Доли категорий:",
+    ]
+
+    for cat, value in sorted(stats.items(), key=lambda x: x[1], reverse=True):
+        share = (value / total_sum) * 100 if total_sum > 0 else 0
+        lines.append(f"• {cat}: {value:.2f} ({share:.1f}%)")
+
+    await message.answer("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+# --------- /export и /make ----------
+
+@router.message(Command("export"))
+async def cmd_export(message: Message):
+    file_path = export_to_excel()
+    doc = FSInputFile(file_path)
+    await message.answer_document(doc, caption="Экспорт расходов в Excel.")
+
+
+@router.message(Command("make"))
+async def cmd_make(message: Message):
+    """
+    Делает то же самое, что /export — формирует Excel-отчёт.
+    Если захочешь другое поведение — переделаем.
+    """
+    file_path = export_to_excel()
+    doc = FSInputFile(file_path)
+    await message.answer_document(doc, caption="Сформирован отчёт (Excel).")
+
+
+# --------- ОБЫЧНЫЙ ВВОД "Категория-Сумма" ----------
+
+@router.message(F.text)
+async def handle_single_line(message: Message, state: FSMContext):
+    """
+    Обрабатывает одиночную строку вне режимов /insert и /limit.
+    Формат: Категория-Сумма
+    """
+    # если мы в каком-то состоянии FSM — не трогаем (там свои хендлеры)
+    current_state = await state.get_state()
+    if current_state is not None:
+        return
+
+    pairs, errors = parse_lines_to_pairs(message.text)
+
+    if not pairs and errors:
+        err_text = (
+            "⚠ Ошибка: Не удалось найти корректную строку в сообщении.\n\n"
+            "Пример правильного формата:\n"
+            "`Еда-500`\n"
+            "`Такси-300`\n"
+            "`Кофе-200`"
+        )
+        await message.answer(err_text, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # Здесь ожидаем, что пользователь отправил одну строку
+    category, amount = pairs[0]
+    add_expense(category, amount)
+    await message.answer(f"✅ Записал: {category} — {amount:.2f}")
 
 
 # ==========================
-# ЗАПУСК БОТА
+#  MAIN
 # ==========================
-
 
 async def main():
-    if BOT_TOKEN == "ВСТАВЬ_СЮДА_СВОЙ_ТОКЕН":
+    logger.info("Запускаем DuckLedger...")
+
+    if not BOT_TOKEN:
         raise RuntimeError("Укажи токен бота в BOT_TOKEN или переменной TELEGRAM_TOKEN")
 
-    logger.info("Инициализация базы данных...")
     init_db()
 
-    bot = Bot(BOT_TOKEN)
-    dp = Dispatcher()
+    bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
 
-    # Команды
-    dp.message.register(cmd_start, CommandStart())
-    dp.message.register(cmd_help, Command("help"))
-    dp.message.register(cmd_insert, Command("insert"))
-    dp.message.register(cmd_limit, Command("limit"))
-    dp.message.register(cmd_export, Command("export"))
-
-    # Стейты
-    dp.message.register(process_insert, InsertStates.waiting_for_data)
-    dp.message.register(process_limit, LimitStates.waiting_for_data)
-
-    # Фолбэк на любой текст
-    dp.message.register(fallback_message, F.text)
-
-    logger.info("Запускаем DuckLedger...")
+    # Для Render: обычный polling (без вебхуков)
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
