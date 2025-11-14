@@ -1,4 +1,6 @@
 aiogram==3.4.1
 openpyxl
 python-dotenv
+pydantic==2.5.3
+pydantic-core==2.14.6
 
