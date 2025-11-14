@@ -97,17 +97,28 @@ def init_db() -> None:
     logger.info("Инициализация базы данных...")
 
 
-def add_expense(category: str, amount: float) -> None:
-    """Добавить расход."""
-    ts = get_local_now().isoformat(timespec="seconds")
+from datetime import datetime, timezone, timedelta
+
+LOCAL_TZ = timezone(timedelta(hours=3))  # Москва / твой часовой пояс
+
+def add_expense(category: str, amount: float):
+    """Добавить расход в БД."""
+    # Дата в локальном поясе, формат как в Excel: 14/11/2025
+    ts = datetime.now(LOCAL_TZ).strftime("%d/%m/%Y")
+
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO expenses (category, amount, timestamp) VALUES (?, ?, ?)",
-        (category.strip(), amount, ts),
+        """
+        INSERT INTO expenses (category, amount, timestamp)
+        VALUES (?, ?, ?)
+        """,
+        (category, amount, ts),
     )
     conn.commit()
     conn.close()
+    logger.info(f"Добавлен расход: {category} - {amount}, дата: {ts}")
+
 
 
 def set_limits(pairs: List[Tuple[str, float]]) -> None:
@@ -190,23 +201,54 @@ def get_full_stats() -> MonthStats:
     return MonthStats(total=total, by_category=by_cat, limits=limits)
 
 
-def export_to_excel(file_path: str) -> None:
+def export_to_excel(file_path: str):
     """
-    Формируем Excel в формате:
+    Экспорт расходов в Excel.
 
-    Дата | Кат1 | Кат2 | ...
-
-    где значения — сумма расходов по дате и категории.
+    Формат:
+    Дата | Категория1 | Категория2 | ...
+    14/11/2025 | 1000 | 500 | ...
     """
-    rows = _load_all_expenses()
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT timestamp, category, amount FROM expenses ORDER BY timestamp"
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
     if not rows:
-        # создаём пустой файл с шапкой
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Расходы"
-        ws.append(["Дата"])
-        wb.save(file_path)
-        return
+        return False
+
+    # Собираем все даты и категории
+    dates = sorted({row[0] for row in rows})
+    categories = sorted({row[1] for row in rows})
+
+    # Агрегируем суммы: дата -> категория -> сумма
+    data = {d: {c: 0 for c in categories} for d in dates}
+    for ts, cat, amount in rows:
+        data[ts][cat] += amount
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Расходы"
+
+    # Заголовки
+    ws.cell(row=1, column=1, value="Дата")
+    for col, cat in enumerate(categories, start=2):
+        ws.cell(row=1, column=col, value=cat)
+
+    # Строки по датам
+    for row_idx, d in enumerate(dates, start=2):
+        ws.cell(row=row_idx, column=1, value=d)
+        for col_idx, cat in enumerate(categories, start=2):
+            val = data[d][cat]
+            if val:  # пустые не пишем, чтобы не засорять нулями
+                ws.cell(row=row_idx, column=col_idx, value=val)
+
+    wb.save(file_path)
+    return True
+
 
     # Собираем все даты и категории
     data: Dict[datetime.date, Dict[str, float]] = {}
@@ -467,13 +509,56 @@ async def _send_excel(message: Message, clear_after: bool) -> None:
 
 
 @router.message(Command("export"))
-async def cmd_export(message: Message) -> None:
-    await _send_excel(message, clear_after=False)
+async def cmd_export(message: Message):
+    tmp_dir = Path("export")
+    tmp_dir.mkdir(exist_ok=True)
+    file_path = tmp_dir / "expenses.xlsx"
+
+    if not export_to_excel(str(file_path)):
+        await message.answer("Нет данных для экспорта.")
+        return
+
+    await message.answer_document(
+        FSInputFile(str(file_path)),
+        caption="Вот твоя таблица расходов 📊",
+    )
+
 
 
 @router.message(Command("make"))
-async def cmd_make(message: Message) -> None:
-    await _send_excel(message, clear_after=True)
+async def cmd_make(message: Message):
+    """
+    1) Выгружает Excel в агрегированном формате (как /export).
+    2) Очищает таблицу expenses.
+    3) Предупреждает, что данные сброшены.
+    """
+    tmp_dir = Path("export")
+    tmp_dir.mkdir(exist_ok=True)
+    file_path = tmp_dir / "expenses_make.xlsx"
+
+    if not export_to_excel(str(file_path)):
+        await message.answer("Нет данных для формирования отчёта.")
+        return
+
+    await message.answer_document(
+        FSInputFile(str(file_path)),
+        caption=(
+            "Отчёт сформирован ✅\n\n"
+            "Файл содержит ВСЕ текущие данные. "
+            "После этого база будет очищена."
+        ),
+    )
+
+    # Чистим базу
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM expenses")
+    conn.commit()
+    conn.close()
+
+    await message.answer(
+        "Данные в боте очищены. Сохрани файл, если он тебе нужен 📁"
+    )
 
 
 # ---------- одиночная строка "Категория-Сумма" ----------
@@ -516,6 +601,7 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
