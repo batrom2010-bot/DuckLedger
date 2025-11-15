@@ -17,6 +17,7 @@ from aiogram.types import (
     Message,
 )
 from openpyxl import Workbook
+from pathlib import Path
 
 # ===============================
 # НАСТРОЙКИ
@@ -601,6 +602,7 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
